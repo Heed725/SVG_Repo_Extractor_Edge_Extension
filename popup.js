@@ -31,83 +31,151 @@ function filenameFromUrl(url, fallbackIndex) {
   }
 }
 
-async function scanRenderedPage() {
+// Runs inside the open SVGRepo tab, where the user's verified browser session
+// and same-origin access can be used to read all collection pages.
+async function scanRenderedCollection() {
   const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
   if (!location.hostname.endsWith("svgrepo.com")) {
     throw new Error("Open an SVGRepo collection page first.");
   }
 
-  // Scroll through the rendered page so lazy-loaded collection icons appear.
+  const currentUrl = new URL(location.href);
+  const pathParts = currentUrl.pathname.split("/").filter(Boolean);
+  const collectionIndex = pathParts.indexOf("collection");
+  if (collectionIndex < 0 || !pathParts[collectionIndex + 1]) {
+    throw new Error("This is not an SVGRepo collection page.");
+  }
+
+  const rawSlug = pathParts[collectionIndex + 1];
+  const collectionPath = `/collection/${rawSlug}`;
+
+  const pageNumberFromUrl = (url) => {
+    try {
+      const parts = new URL(url, location.href).pathname.split("/").filter(Boolean);
+      const i = parts.indexOf("collection");
+      const value = i >= 0 ? Number(parts[i + 2]) : NaN;
+      return Number.isInteger(value) && value > 0 ? value : 1;
+    } catch (_) {
+      return 1;
+    }
+  };
+
+  const readPageCounter = (doc) => {
+    const text = doc.body?.innerText || doc.body?.textContent || "";
+    const matches = [...text.matchAll(/Page\s+(\d+)\s*\/\s*(\d+)/gi)];
+    if (!matches.length) return { current: 1, total: 1 };
+    return {
+      current: Number(matches[0][1]) || 1,
+      total: Math.max(1, ...matches.map(match => Number(match[2]) || 1))
+    };
+  };
+
+  const pageUrl = (pageNumber) => {
+    const url = new URL(currentUrl.origin);
+    url.pathname = pageNumber === 1
+      ? `${collectionPath}/`
+      : `${collectionPath}/${pageNumber}`;
+    return url.href;
+  };
+
+  const extractItems = (doc, sourceUrl, pageNumber) => {
+    const candidates = [];
+    const seen = new Set();
+
+    const add = (value, label = "") => {
+      if (!value) return;
+      try {
+        const absolute = new URL(value, sourceUrl).href;
+        if (!/^https?:/i.test(absolute) || !/\.svg(?:$|[?#])/i.test(absolute)) return;
+        if (seen.has(absolute)) return;
+        seen.add(absolute);
+        candidates.push({ url: absolute, label, page: pageNumber });
+      } catch (_) {}
+    };
+
+    doc.querySelectorAll('[itemprop="contentUrl"]').forEach((el) => {
+      const label = el.getAttribute("alt") || el.getAttribute("title") || "";
+      ["src", "data-src", "data-lazy-src", "content", "href"]
+        .forEach(attr => add(el.getAttribute(attr), label));
+      if (el.currentSrc) add(el.currentSrc, label);
+    });
+
+    // Fallback for future SVGRepo markup changes.
+    doc.querySelectorAll("img, source, a, meta").forEach((el) => {
+      const label = el.getAttribute("alt") || el.getAttribute("title") || el.textContent?.trim() || "";
+      ["src", "href", "data-src", "data-lazy-src", "content"]
+        .forEach(attr => add(el.getAttribute(attr), label));
+
+      const srcset = el.getAttribute("srcset");
+      if (srcset) {
+        srcset.split(",").forEach(part => add(part.trim().split(/\s+/)[0], label));
+      }
+    });
+
+    // Actual SVGRepo assets use /show/<id>/<name>.svg. Prefer these so the
+    // site's own logo and navigation graphics are not included.
+    const directAssets = candidates.filter(item => /\/show\/\d+\/[^/?#]+\.svg(?:$|[?#])/i.test(item.url));
+    return directAssets.length ? directAssets : candidates;
+  };
+
+  // Scroll the current page first so its lazy-loaded markup is complete.
   let lastHeight = 0;
   for (let i = 0; i < 20; i++) {
     window.scrollTo(0, document.body.scrollHeight);
-    await sleep(300);
-    const h = document.body.scrollHeight;
-    if (h === lastHeight) break;
-    lastHeight = h;
+    await sleep(250);
+    const height = document.body.scrollHeight;
+    if (height === lastHeight) break;
+    lastHeight = height;
   }
   window.scrollTo(0, 0);
-  await sleep(300);
+  await sleep(200);
 
-  const candidates = [];
-  const seen = new Set();
+  const counter = readPageCounter(document);
+  const currentPage = pageNumberFromUrl(currentUrl.href) || counter.current;
+  const totalPages = counter.total;
+  const allItems = [];
+  const pageResults = [];
 
-  const add = (value, label = "") => {
-    if (!value) return;
+  for (let page = 1; page <= totalPages; page++) {
     try {
-      const absolute = new URL(value, location.href).href;
-      if (!/^https?:/i.test(absolute)) return;
-      if (seen.has(absolute)) return;
-      seen.add(absolute);
-      candidates.push({ url: absolute, label });
-    } catch (_) {}
-  };
+      let pageDocument;
+      const url = pageUrl(page);
 
-  // SVGRepo historically exposes the downloadable SVG using itemprop=contentUrl.
-  document.querySelectorAll('[itemprop="contentUrl"]').forEach((el) => {
-    const label = el.getAttribute("alt") || el.getAttribute("title") || "";
-    ["src", "data-src", "data-lazy-src", "content", "href"].forEach(attr => add(el.getAttribute(attr), label));
-    if (el.currentSrc) add(el.currentSrc, label);
-  });
+      if (page === currentPage) {
+        pageDocument = document;
+      } else {
+        const response = await fetch(url, {
+          credentials: "include",
+          cache: "no-store",
+          headers: { "Accept": "text/html" }
+        });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
 
-  // Also capture explicit SVG URLs found anywhere on the rendered page.
-  document.querySelectorAll("img, source, a").forEach((el) => {
-    const label = el.getAttribute("alt") || el.getAttribute("title") || el.textContent?.trim() || "";
-    const values = [el.getAttribute("src"), el.getAttribute("href"), el.getAttribute("data-src"), el.currentSrc];
-    values.filter(Boolean).forEach(value => {
-      if (/\.svg(?:$|[?#])/i.test(value)) add(value, label);
-    });
+        const html = await response.text();
+        pageDocument = new DOMParser().parseFromString(html, "text/html");
+      }
 
-    const srcset = el.getAttribute("srcset");
-    if (srcset) {
-      srcset.split(",").forEach(part => {
-        const value = part.trim().split(/\s+/)[0];
-        if (/\.svg(?:$|[?#])/i.test(value)) add(value, label);
-      });
+      const items = extractItems(pageDocument, url, page);
+      allItems.push(...items);
+      pageResults.push({ page, count: items.length, ok: true });
+    } catch (error) {
+      pageResults.push({ page, count: 0, ok: false, error: error.message });
     }
-  });
 
-  // Prefer URLs that look like actual SVG assets.
-  const likelySvg = candidates.filter(item =>
-    /\.svg(?:$|[?#])/i.test(item.url) ||
-    /itemprop/i.test(item.label || "") ||
-    /svg/i.test(item.label || "")
-  );
-
-  const pathParts = location.pathname.split("/").filter(Boolean);
-  let slug = "svgrepo-collection";
-  const collectionIndex = pathParts.indexOf("collection");
-  if (collectionIndex >= 0 && pathParts[collectionIndex + 1]) {
-    slug = pathParts[collectionIndex + 1];
-  } else if (document.querySelector("h1")) {
-    slug = document.querySelector("h1").textContent;
+    // A small pause reduces the chance of triggering server rate limits.
+    if (page < totalPages) await sleep(300);
   }
+
+  const uniqueItems = Array.from(new Map(allItems.map(item => [item.url, item])).values());
+  const heading = document.querySelector("h1")?.textContent || rawSlug;
 
   return {
     title: document.title,
-    slug,
-    items: likelySvg.length ? likelySvg : candidates
+    slug: rawSlug || heading,
+    totalPages,
+    pageResults,
+    items: uniqueItems
   };
 }
 
@@ -115,7 +183,7 @@ scanBtn.addEventListener("click", async () => {
   foundItems = [];
   downloadBtn.disabled = true;
   detailsEl.textContent = "";
-  setStatus("Scanning the rendered collection page…");
+  setStatus("Detecting and scanning every collection page…");
 
   try {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -123,7 +191,7 @@ scanBtn.addEventListener("click", async () => {
 
     const results = await chrome.scripting.executeScript({
       target: { tabId: tab.id },
-      func: scanRenderedPage
+      func: scanRenderedCollection
     });
 
     const data = results?.[0]?.result;
@@ -134,14 +202,23 @@ scanBtn.addEventListener("click", async () => {
       new Map((data.items || []).map(item => [item.url, item])).values()
     );
 
+    const failedPages = (data.pageResults || []).filter(result => !result.ok);
+    const pageSummary = (data.pageResults || [])
+      .map(result => result.ok
+        ? `Page ${result.page}/${data.totalPages}: ${result.count} SVG(s)`
+        : `Page ${result.page}/${data.totalPages}: FAILED (${result.error})`)
+      .join("\n");
+
     if (!foundItems.length) {
-      setStatus("No direct SVG asset URLs were found on the rendered page.");
-      detailsEl.textContent = "If the collection itself is visible, SVGRepo may have changed how it embeds its files.";
+      setStatus(`Scanned ${data.totalPages} page(s), but found no direct SVG asset URLs.`);
+      detailsEl.textContent = pageSummary || "SVGRepo may have changed how it embeds its files.";
       return;
     }
 
-    setStatus(`Found ${foundItems.length} candidate SVG file(s).`);
-    detailsEl.textContent = foundItems.map((item, i) => `${i + 1}. ${item.url}`).join("\n");
+    const warning = failedPages.length ? ` ${failedPages.length} page(s) failed.` : "";
+    setStatus(`Found ${foundItems.length} SVG file(s) across ${data.totalPages} page(s).${warning}`);
+    detailsEl.textContent = `${pageSummary}\n\n` +
+      foundItems.map((item, i) => `${i + 1}. [page ${item.page}] ${item.url}`).join("\n");
     downloadBtn.disabled = false;
   } catch (error) {
     setStatus(`Scan failed: ${error.message}`);

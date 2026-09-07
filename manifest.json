@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "SVGRepo Collection Downloader",
-  "version": "1.0.0",
-  "description": "Download SVG files from the SVGRepo collection page you have opened normally in Microsoft Edge.",
+  "version": "1.1.0",
+  "description": "Detect every page in an SVGRepo collection and download its SVG files in Microsoft Edge.",
   "permissions": [
     "activeTab",
     "scripting",
