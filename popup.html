@@ -1,0 +1,27 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SVGRepo Downloader</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <main>
+    <h1>SVGRepo Downloader</h1>
+    <p class="hint">Open an SVGRepo collection normally in Edge, pass any browser check yourself, then use this extension.</p>
+
+    <button id="scanBtn">1. Scan current collection</button>
+    <button id="downloadBtn" disabled>2. Download SVGs</button>
+
+    <label class="row">
+      <input id="saveAs" type="checkbox">
+      <span>Ask where to save each file</span>
+    </label>
+
+    <div id="status">Ready.</div>
+    <div id="details"></div>
+  </main>
+  <script src="popup.js"></script>
+</body>
+</html>
